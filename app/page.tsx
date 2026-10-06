@@ -1,6 +1,7 @@
 "use client";
 
 import { FormEvent, useEffect, useMemo, useState } from "react";
+import type { User } from "@supabase/supabase-js";
 import { supabase } from "@/lib/supabase";
 
 type Task = {
@@ -32,6 +33,13 @@ const emptyTask: Task = {
 };
 
 export default function Home() {
+  const [user, setUser] = useState<User | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [loginLoading, setLoginLoading] = useState(false);
+  const [loginError, setLoginError] = useState("");
+
   const [tasks, setTasks] = useState<Task[]>([]);
   const [form, setForm] = useState<Task>(emptyTask);
   const [aiText, setAiText] = useState("");
@@ -41,11 +49,58 @@ export default function Home() {
   const [message, setMessage] = useState("");
 
   useEffect(() => {
-    loadTasks();
+    async function initAuth() {
+      const { data } = await supabase.auth.getSession();
+      setUser(data.session?.user ?? null);
+      setAuthLoading(false);
+    }
+
+    initAuth();
+
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => {
+      setUser(session?.user ?? null);
+    });
+
+    return () => {
+      listener.subscription.unsubscribe();
+    };
   }, []);
+
+  useEffect(() => {
+    if (user) {
+      loadTasks();
+    } else {
+      setTasks([]);
+      setLoading(false);
+    }
+  }, [user]);
+
+  async function signIn(e: FormEvent) {
+    e.preventDefault();
+    setLoginLoading(true);
+    setLoginError("");
+
+    const { error } = await supabase.auth.signInWithPassword({
+      email: email.trim(),
+      password
+    });
+
+    if (error) {
+      console.error(error);
+      setLoginError("Email o contraseña incorrectos.");
+    }
+
+    setLoginLoading(false);
+  }
+
+  async function signOut() {
+    await supabase.auth.signOut();
+    setMessage("");
+  }
 
   async function loadTasks() {
     setLoading(true);
+
     const { data, error } = await supabase
       .from("tareas")
       .select(`
@@ -265,7 +320,10 @@ export default function Home() {
 
     const { error } = await supabase
       .from("tareas")
-      .update({ estado: next, updated_at: new Date().toISOString() })
+      .update({
+        estado: next,
+        updated_at: new Date().toISOString()
+      })
       .eq("id", id);
 
     if (error) {
@@ -292,11 +350,97 @@ export default function Home() {
     await loadTasks();
   }
 
+  if (authLoading) {
+    return (
+      <main className="shell">
+        <div className="container">
+          <div className="card">Cargando...</div>
+        </div>
+      </main>
+    );
+  }
+
+  if (!user) {
+    return (
+      <main className="shell">
+        <header className="topbar">
+          <h1>Control de Obra</h1>
+          <small>Acceso al sistema</small>
+        </header>
+
+        <div className="container" style={{ maxWidth: 480 }}>
+          <div className="card" style={{ marginTop: 40 }}>
+            <h2>Iniciar sesión</h2>
+            <p style={{ color: "#65717e", fontSize: 14 }}>
+              Ingresá con el usuario creado en Supabase.
+            </p>
+
+            <form onSubmit={signIn}>
+              <label>Email</label>
+              <input
+                type="email"
+                value={email}
+                onChange={e => setEmail(e.target.value)}
+                required
+                autoComplete="email"
+              />
+
+              <label>Contraseña</label>
+              <input
+                type="password"
+                value={password}
+                onChange={e => setPassword(e.target.value)}
+                required
+                autoComplete="current-password"
+              />
+
+              {loginError && (
+                <div style={{
+                  marginTop: 12,
+                  padding: 10,
+                  borderRadius: 8,
+                  background: "#f5eeee"
+                }}>
+                  {loginError}
+                </div>
+              )}
+
+              <div className="actions">
+                <button className="primary" disabled={loginLoading}>
+                  {loginLoading ? "Ingresando..." : "Ingresar"}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      </main>
+    );
+  }
+
   return (
     <main className="shell">
       <header className="topbar">
-        <h1>Control de Obra</h1>
-        <small>Gestión de tareas y pendientes · Supabase conectado</small>
+        <div style={{
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          gap: 12,
+          flexWrap: "wrap"
+        }}>
+          <div>
+            <h1>Control de Obra</h1>
+            <small>Gestión de tareas y pendientes</small>
+          </div>
+
+          <div style={{ textAlign: "right" }}>
+            <small style={{ display: "block", marginBottom: 6 }}>
+              {user.email}
+            </small>
+            <button className="secondary" onClick={signOut}>
+              Cerrar sesión
+            </button>
+          </div>
+        </div>
       </header>
 
       <div className="container">
@@ -371,7 +515,11 @@ export default function Home() {
               </select>
 
               <label>Fecha límite</label>
-              <input type="date" value={form.fechaLimite} onChange={e => update("fechaLimite", e.target.value)} />
+              <input
+                type="date"
+                value={form.fechaLimite}
+                onChange={e => update("fechaLimite", e.target.value)}
+              />
 
               <div className="actions">
                 <button className="primary">Guardar tarea</button>
