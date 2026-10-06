@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import type { User } from "@supabase/supabase-js";
 import { supabase } from "@/lib/supabase";
 
@@ -16,6 +16,13 @@ type Task = {
   prioridad: "Baja" | "Media" | "Alta";
   estado: "Pendiente" | "Asignada" | "Terminada" | "Verificada";
   fechaLimite: string;
+};
+
+type PhotoView = {
+  id: string;
+  tipo: string;
+  path: string;
+  signedUrl: string;
 };
 
 const emptyTask: Task = {
@@ -48,6 +55,12 @@ export default function Home() {
   const [loading, setLoading] = useState(true);
   const [message, setMessage] = useState("");
 
+  const [initialPhoto, setInitialPhoto] = useState<File | null>(null);
+  const [photosByTask, setPhotosByTask] = useState<Record<string, PhotoView[]>>({});
+  const [uploadingTaskId, setUploadingTaskId] = useState<string | null>(null);
+
+  const finalPhotoInputs = useRef<Record<string, HTMLInputElement | null>>({});
+
   useEffect(() => {
     async function initAuth() {
       const { data } = await supabase.auth.getSession();
@@ -71,6 +84,7 @@ export default function Home() {
       loadTasks();
     } else {
       setTasks([]);
+      setPhotosByTask({});
       setLoading(false);
     }
   }, [user]);
@@ -138,7 +152,45 @@ export default function Home() {
     }));
 
     setTasks(mapped);
+    await loadAllPhotos(mapped.map(t => t.id));
     setLoading(false);
+  }
+
+  async function loadAllPhotos(taskIds: string[]) {
+    if (taskIds.length === 0) {
+      setPhotosByTask({});
+      return;
+    }
+
+    const { data, error } = await supabase
+      .from("fotos")
+      .select("id, tarea_id, url, tipo")
+      .in("tarea_id", taskIds)
+      .order("created_at", { ascending: true });
+
+    if (error) {
+      console.error(error);
+      return;
+    }
+
+    const map: Record<string, PhotoView[]> = {};
+
+    for (const photo of data || []) {
+      const { data: signed } = await supabase.storage
+        .from("tareas-fotos")
+        .createSignedUrl(photo.url, 60 * 60);
+
+      if (!map[photo.tarea_id]) map[photo.tarea_id] = [];
+
+      map[photo.tarea_id].push({
+        id: photo.id,
+        tipo: photo.tipo || "Foto",
+        path: photo.url,
+        signedUrl: signed?.signedUrl || ""
+      });
+    }
+
+    setPhotosByTask(map);
   }
 
   const counts = useMemo(() => ({
@@ -230,6 +282,52 @@ export default function Home() {
     return data.id;
   }
 
+  function sanitizeFileName(name: string) {
+    return name
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .replace(/[^a-zA-Z0-9._-]/g, "_");
+  }
+
+  async function uploadPhoto(taskId: string, file: File, tipo: "Inicial" | "Final") {
+    if (!user) throw new Error("Usuario no autenticado");
+
+    if (!file.type.startsWith("image/")) {
+      throw new Error("El archivo debe ser una imagen.");
+    }
+
+    const maxSize = 10 * 1024 * 1024;
+    if (file.size > maxSize) {
+      throw new Error("La imagen supera los 10 MB.");
+    }
+
+    const safeName = sanitizeFileName(file.name || "foto.jpg");
+    const path = `${user.id}/${taskId}/${tipo.toLowerCase()}-${Date.now()}-${safeName}`;
+
+    const { error: storageError } = await supabase.storage
+      .from("tareas-fotos")
+      .upload(path, file, {
+        cacheControl: "3600",
+        upsert: false,
+        contentType: file.type
+      });
+
+    if (storageError) throw storageError;
+
+    const { error: dbError } = await supabase
+      .from("fotos")
+      .insert({
+        tarea_id: taskId,
+        url: path,
+        tipo
+      });
+
+    if (dbError) {
+      await supabase.storage.from("tareas-fotos").remove([path]);
+      throw dbError;
+    }
+  }
+
   async function saveTask(e: FormEvent) {
     e.preventDefault();
     setMessage("");
@@ -254,7 +352,7 @@ export default function Home() {
         form.ambiente
       );
 
-      const { error } = await supabase
+      const { data: taskCreated, error } = await supabase
         .from("tareas")
         .insert({
           obra_id: obraId,
@@ -265,17 +363,24 @@ export default function Home() {
           prioridad: form.prioridad,
           estado: "Pendiente",
           fecha_limite: form.fechaLimite || null
-        });
+        })
+        .select("id")
+        .single();
 
       if (error) throw error;
 
+      if (initialPhoto) {
+        await uploadPhoto(taskCreated.id, initialPhoto, "Inicial");
+      }
+
       setForm({ ...emptyTask, obra: form.obra });
       setAiText("");
-      setMessage("Tarea guardada en Supabase.");
+      setInitialPhoto(null);
+      setMessage("Tarea guardada correctamente.");
       await loadTasks();
-    } catch (error) {
+    } catch (error: any) {
       console.error(error);
-      setMessage("No se pudo guardar la tarea en Supabase.");
+      setMessage(error?.message || "No se pudo guardar la tarea.");
     }
   }
 
@@ -335,7 +440,35 @@ export default function Home() {
     await loadTasks();
   }
 
+  async function handleFinalPhoto(taskId: string, file: File | null) {
+    if (!file) return;
+
+    setUploadingTaskId(taskId);
+    setMessage("");
+
+    try {
+      await uploadPhoto(taskId, file, "Final");
+      setMessage("Foto final guardada correctamente.");
+      await loadTasks();
+    } catch (error: any) {
+      console.error(error);
+      setMessage(error?.message || "No se pudo guardar la foto final.");
+    } finally {
+      setUploadingTaskId(null);
+      const input = finalPhotoInputs.current[taskId];
+      if (input) input.value = "";
+    }
+  }
+
   async function deleteTask(id: string) {
+    const taskPhotos = photosByTask[id] || [];
+
+    if (taskPhotos.length > 0) {
+      await supabase.storage
+        .from("tareas-fotos")
+        .remove(taskPhotos.map(p => p.path));
+    }
+
     const { error } = await supabase
       .from("tareas")
       .delete()
@@ -371,9 +504,6 @@ export default function Home() {
         <div className="container" style={{ maxWidth: 480 }}>
           <div className="card" style={{ marginTop: 40 }}>
             <h2>Iniciar sesión</h2>
-            <p style={{ color: "#65717e", fontSize: 14 }}>
-              Ingresá con el usuario creado en Supabase.
-            </p>
 
             <form onSubmit={signIn}>
               <label>Email</label>
@@ -382,7 +512,6 @@ export default function Home() {
                 value={email}
                 onChange={e => setEmail(e.target.value)}
                 required
-                autoComplete="email"
               />
 
               <label>Contraseña</label>
@@ -391,16 +520,10 @@ export default function Home() {
                 value={password}
                 onChange={e => setPassword(e.target.value)}
                 required
-                autoComplete="current-password"
               />
 
               {loginError && (
-                <div style={{
-                  marginTop: 12,
-                  padding: 10,
-                  borderRadius: 8,
-                  background: "#f5eeee"
-                }}>
+                <div style={{ marginTop: 12 }}>
                   {loginError}
                 </div>
               )}
@@ -429,7 +552,7 @@ export default function Home() {
         }}>
           <div>
             <h1>Control de Obra</h1>
-            <small>Gestión de tareas y pendientes</small>
+            <small>Gestión de tareas, pendientes y fotografías</small>
           </div>
 
           <div style={{ textAlign: "right" }}>
@@ -521,6 +644,20 @@ export default function Home() {
                 onChange={e => update("fechaLimite", e.target.value)}
               />
 
+              <label>Foto inicial (opcional)</label>
+              <input
+                type="file"
+                accept="image/*"
+                capture="environment"
+                onChange={e => setInitialPhoto(e.target.files?.[0] || null)}
+              />
+
+              {initialPhoto && (
+                <div className="meta" style={{ marginTop: 6 }}>
+                  Foto seleccionada: {initialPhoto.name}
+                </div>
+              )}
+
               <div className="actions">
                 <button className="primary">Guardar tarea</button>
               </div>
@@ -550,32 +687,92 @@ export default function Home() {
               <div className="empty">Todavía no hay tareas cargadas.</div>
             )}
 
-            {visibleTasks.map(task => (
-              <div className="task" key={task.id}>
-                <div className="taskHeader">
-                  <div className="taskTitle">{task.descripcion}</div>
-                  <span className="badge">{task.estado}</span>
-                </div>
+            {visibleTasks.map(task => {
+              const photos = photosByTask[task.id] || [];
 
-                <div className="meta">
-                  {task.obra} · Piso {task.piso || "-"} · {task.unidad || "Sin unidad"}<br/>
-                  {task.ambiente ? `${task.ambiente} · ` : ""}
-                  {task.rubro} · {task.prioridad} · Responsable: {task.responsable || "Sin asignar"}
-                </div>
+              return (
+                <div className="task" key={task.id}>
+                  <div className="taskHeader">
+                    <div className="taskTitle">{task.descripcion}</div>
+                    <span className="badge">{task.estado}</span>
+                  </div>
 
-                <div className="actions">
-                  {task.estado !== "Verificada" && (
-                    <button className="secondary" onClick={() => cycleState(task.id)}>
-                      Avanzar estado
-                    </button>
+                  <div className="meta">
+                    {task.obra} · Piso {task.piso || "-"} · {task.unidad || "Sin unidad"}<br/>
+                    {task.ambiente ? `${task.ambiente} · ` : ""}
+                    {task.rubro} · {task.prioridad} · Responsable: {task.responsable || "Sin asignar"}
+                  </div>
+
+                  {photos.length > 0 && (
+                    <div style={{
+                      display: "grid",
+                      gridTemplateColumns: "repeat(auto-fill, minmax(120px, 1fr))",
+                      gap: 8,
+                      marginTop: 12
+                    }}>
+                      {photos.map(photo => (
+                        <div key={photo.id}>
+                          <div className="meta" style={{ marginBottom: 4 }}>
+                            {photo.tipo}
+                          </div>
+                          {photo.signedUrl && (
+                            <a
+                              href={photo.signedUrl}
+                              target="_blank"
+                              rel="noreferrer"
+                            >
+                              <img
+                                src={photo.signedUrl}
+                                alt={`Foto ${photo.tipo}`}
+                                style={{
+                                  width: "100%",
+                                  height: 100,
+                                  objectFit: "cover",
+                                  borderRadius: 8,
+                                  border: "1px solid #e2e6eb"
+                                }}
+                              />
+                            </a>
+                          )}
+                        </div>
+                      ))}
+                    </div>
                   )}
 
-                  <button className="secondary" onClick={() => deleteTask(task.id)}>
-                    Eliminar
-                  </button>
+                  <div className="actions" style={{ flexWrap: "wrap" }}>
+                    {task.estado !== "Verificada" && (
+                      <button className="secondary" onClick={() => cycleState(task.id)}>
+                        Avanzar estado
+                      </button>
+                    )}
+
+                    <input
+                      ref={el => {
+                        finalPhotoInputs.current[task.id] = el;
+                      }}
+                      type="file"
+                      accept="image/*"
+                      capture="environment"
+                      style={{ display: "none" }}
+                      onChange={e => handleFinalPhoto(task.id, e.target.files?.[0] || null)}
+                    />
+
+                    <button
+                      className="secondary"
+                      type="button"
+                      disabled={uploadingTaskId === task.id}
+                      onClick={() => finalPhotoInputs.current[task.id]?.click()}
+                    >
+                      {uploadingTaskId === task.id ? "Subiendo..." : "Agregar foto final"}
+                    </button>
+
+                    <button className="secondary" onClick={() => deleteTask(task.id)}>
+                      Eliminar
+                    </button>
+                  </div>
                 </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         </section>
       </div>
